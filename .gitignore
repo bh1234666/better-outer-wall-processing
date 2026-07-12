@@ -1,0 +1,6 @@
+__pycache__/
+processed/
+*.pyc
+*.pyo
+*.gcode
+progress.log
