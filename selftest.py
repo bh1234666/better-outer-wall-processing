@@ -248,16 +248,21 @@ def check_config_roundtrip() -> None:
         custom["seam_mode"] = "flat"
         custom["seam_superres_x"] = 7
         custom["keep_processed_copy"] = True
+        custom["spiral_angle_speed_enabled"] = True
+        custom["spiral_angle_speed_profile"] = "45:1,0:0.5"
         plugin.save_config(custom)
         loaded = plugin.load_config()
         assert loaded["enabled"] is False
         assert loaded["seam_mode"] == "flat"
         assert loaded["seam_superres_x"] == 7
         assert loaded["keep_processed_copy"] is True
+        assert loaded["spiral_angle_speed_enabled"] is True
+        assert loaded["spiral_angle_speed_profile"] == "45:1,0:0.5"
         assert plugin.coerce_config_value("bool", 1) is True
         assert plugin.coerce_config_value("int", "4") == 4
         assert abs(plugin.coerce_config_value("float", "1.25") - 1.25) < 1e-9
         assert plugin.coerce_config_value("enum", "spiral") == "spiral"
+        assert plugin.coerce_config_value("text", "45:1,0:.5") == "45:1,0:.5"
     finally:
         plugin.CONFIG_PATH = orig_config_path
         plugin.LOG_PATH = orig_log_path
@@ -297,6 +302,201 @@ def check_audit_coverage_script(base: Path) -> None:
         assert_contains(proc.stdout, "cv=")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def check_spiral_angle_speed() -> None:
+    profile = plugin.parse_spiral_angle_speed_profile(
+        plugin.DEFAULT_SPIRAL_ANGLE_SPEED_PROFILE
+    )
+    expected = {
+        0.0: 0.33,
+        7.5: 0.365,
+        15.0: 0.4,
+        22.5: 0.6,
+        30.0: 0.8,
+        37.5: 0.9,
+        45.0: 1.0,
+        90.0: 1.0,
+    }
+    for angle, scale in expected.items():
+        assert_close(
+            plugin.spiral_angle_speed_multiplier(angle, profile),
+            scale,
+            1e-12,
+            f"angle speed interpolation at {angle}",
+        )
+
+    assert plugin.parse_spiral_angle_speed_profile("0:.33,45:1,15:.4,30:.8") == profile
+    invalid_profiles = ("", "45", "45:1,45:.8", "-1:.3,45:1", "91:1,0:.3", "45:0,0:.3")
+    for raw in invalid_profiles:
+        try:
+            plugin.parse_spiral_angle_speed_profile(raw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid angle speed profile was accepted: {raw!r}")
+    assert plugin.configured_spiral_angle_speed_profile(
+        {"spiral_angle_speed_profile": "invalid"}
+    ) == plugin.DEFAULT_SPIRAL_ANGLE_SPEED_POINTS
+
+    cli_cfg, cli_path = plugin.apply_cli_overrides(
+        dict(plugin.DEFAULT_CONFIG),
+        [
+            "--enable-angle-speed",
+            "--angle-speed-profile",
+            plugin.DEFAULT_SPIRAL_ANGLE_SPEED_PROFILE,
+            "angle-test.gcode",
+        ],
+    )
+    assert cli_cfg["spiral_angle_speed_enabled"] is True
+    assert cli_cfg["spiral_angle_speed_profile"] == plugin.DEFAULT_SPIRAL_ANGLE_SPEED_PROFILE
+    assert cli_path == "angle-test.gcode"
+
+    def ring(radius: float, z: float, layer: int) -> plugin.Loop:
+        points = [
+            (
+                radius * math.cos(2.0 * math.pi * i / 128),
+                radius * math.sin(2.0 * math.pi * i / 128),
+            )
+            for i in range(128)
+        ]
+        segments = []
+        for i, point in enumerate(points):
+            previous = points[i - 1]
+            length = math.hypot(point[0] - previous[0], point[1] - previous[1])
+            segments.append(plugin.Segment(
+                x0=previous[0], y0=previous[1], z0=z,
+                x1=point[0], y1=point[1], z1=z,
+                de=length * 0.04, length=length, line_index=i,
+            ))
+        loop = plugin.Loop(
+            layer_index=layer,
+            z=z,
+            segments=segments,
+            end_insert_index=len(segments),
+        )
+        loop.build_cum()
+        return loop
+
+    layer_height = 0.2
+    radius_step = layer_height / math.tan(math.radians(30.0))
+    original_feed = 1800.0
+    wall_feed = original_feed * 1.66
+    base_cfg = dict(
+        plugin.DEFAULT_CONFIG,
+        dynamic_superres_enabled=False,
+        seam_superres_x=4,
+        seam_comp_length_mm=0.0,
+        spiral_flatten_enabled=False,
+    )
+
+    def generate(direction: int, enabled: bool) -> list[plugin.Ins]:
+        return plugin.build_spiral(
+            ring(10.0, 0.4, 1),
+            dict(base_cfg, spiral_angle_speed_enabled=enabled),
+            layer_height,
+            wall_feed,
+            False,
+            ring(10.0 - direction * radius_step, 0.2, 0),
+            ring(10.0 + direction * radius_step, 0.6, 2),
+        )
+
+    def main_feeds(commands: list[plugin.Ins]) -> list[float]:
+        feeds = []
+        for command in commands:
+            if command.kind == "comment" and "spiral top fill" in command.text:
+                break
+            if command.kind == "extrude" and command.f is not None:
+                feeds.append(command.f)
+        return feeds
+
+    outward = generate(1, True)
+    inward = generate(-1, True)
+    outward_feeds = sorted(main_feeds(outward))
+    inward_feeds = sorted(main_feeds(inward))
+    assert len(outward_feeds) == len(inward_feeds) > 0
+    assert max(abs(a - b) for a, b in zip(outward_feeds, inward_feeds)) < 1e-6, (
+        "outward overhang and inward stacking do not use symmetric speed limits"
+    )
+    mean_feed = sum(outward_feeds) / len(outward_feeds)
+    assert_close(mean_feed, original_feed * 1.66 * 0.8, 2.0, "30 degree spiral feed")
+    assert max(outward_feeds) / min(outward_feeds) < 1.001, "smooth slope feed is discontinuous"
+
+    disabled = generate(1, False)
+    def geometry(command: plugin.Ins):
+        return command.kind, command.text, command.x, command.y, command.z, command.de
+
+    assert [geometry(command) for command in outward] == [geometry(command) for command in disabled], (
+        "angle speed changed spiral geometry or extrusion"
+    )
+    assert all(abs(feed - wall_feed) < 1e-12 for feed in main_feeds(disabled)), (
+        "disabled angle speed changed legacy feed values"
+    )
+
+    vertical = plugin.build_spiral(
+        ring(10.0, 0.4, 1),
+        dict(base_cfg, spiral_angle_speed_enabled=True),
+        layer_height,
+        wall_feed,
+        False,
+        ring(10.0, 0.2, 0),
+        ring(10.0, 0.6, 2),
+    )
+    assert all(abs(feed - wall_feed) < 1e-9 for feed in main_feeds(vertical)), (
+        "vertical wall was incorrectly slowed"
+    )
+
+    dynamic_cfg = dict(
+        base_cfg,
+        seam_superres_x=3,
+        dynamic_superres_enabled=True,
+        superres_max_x=20,
+        spiral_angle_speed_enabled=True,
+    )
+    dynamic = plugin.build_spiral(
+        ring(10.0, 0.4, 1),
+        dynamic_cfg,
+        layer_height,
+        wall_feed,
+        False,
+        ring(9.0, 0.2, 0),
+        ring(11.0, 0.6, 2),
+    )
+    dynamic_main = []
+    dynamic_x = None
+    for command in dynamic:
+        if command.kind == "comment" and command.text.startswith("; BOWP spiral start x"):
+            dynamic_x = int(command.text.rsplit("x", 1)[1])
+        elif command.kind == "comment" and "spiral top fill" in command.text:
+            break
+        elif command.kind == "extrude":
+            dynamic_main.append(command)
+    assert dynamic_x is not None and dynamic_x > dynamic_cfg["seam_superres_x"], (
+        "dynamic super-resolution was not raised in angle speed test"
+    )
+    segment_count = len(dynamic_main) // dynamic_x
+    ring_index = dynamic_x // 2
+    segment_index = segment_count // 4
+
+    def actual_center(revolution: int) -> tuple[float, float, float]:
+        end_index = revolution * segment_count + segment_index
+        start = dynamic_main[end_index - 1]
+        end = dynamic_main[end_index]
+        return (
+            0.5 * (start.x + end.x),
+            0.5 * (start.y + end.y),
+            0.5 * (start.z + end.z),
+        )
+
+    lower = actual_center(ring_index - 1)
+    upper = actual_center(ring_index + 1)
+    actual_angle = math.degrees(math.atan2(
+        abs(upper[2] - lower[2]),
+        math.hypot(upper[0] - lower[0], upper[1] - lower[1]),
+    ))
+    expected_feed = wall_feed * plugin.spiral_angle_speed_multiplier(actual_angle, profile)
+    actual_feed = dynamic_main[ring_index * segment_count + segment_index].f
+    assert_close(actual_feed, expected_feed, 1e-9, "post-super-resolution trajectory feed")
 
 
 def check_validate_gcode_script(base: Path) -> None:
@@ -1188,6 +1388,8 @@ def run() -> None:
         "seam_mode",
         "spiral_flatten_enabled",
         "spiral_xy_interp_enabled",
+        "spiral_angle_speed_enabled",
+        "spiral_angle_speed_profile",
         "travel_speed_mm_s",
         "script_ironing_enabled",
         "path_width_mm",
@@ -1214,12 +1416,13 @@ def run() -> None:
     for field in plugin.CONFIG_FIELDS:
         key = field["key"]
         kind = field["kind"]
-        assert kind in {"bool", "int", "float", "enum"}, f"unexpected field kind for {key}: {kind}"
+        assert kind in {"bool", "int", "float", "enum", "text"}, f"unexpected field kind for {key}: {kind}"
         if kind == "enum":
             assert field.get("options"), f"enum field missing options: {key}"
         assert_contains(html_text, f'id="{key}"')
 
     check_config_roundtrip()
+    check_spiral_angle_speed()
     check_audit_coverage_script(base)
     check_validate_gcode_script(base)
     check_validate_recursive_discovery()

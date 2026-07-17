@@ -26,6 +26,8 @@
   "purge_retract_mm": 1.0,
   "max_overhang_deg": -90.0,
   "spiral_speed_scale": 0.66,
+  "spiral_angle_speed_enabled": false,
+  "spiral_angle_speed_profile": "45:1.0,30:0.8,15:0.4,0:0.33",
   "secondary_speed_scale": 1.0,
   "secondary_seam_speed_scale": 0.67,
   "dynamic_superres_enabled": true,

@@ -52,7 +52,7 @@ class App:
                 widget = ttk.Combobox(form, textvariable=var, values=field["options"], state="readonly", width=14)
             else:
                 var = tk.StringVar(value=str(self.config.get(key, "")))
-                widget = ttk.Entry(form, textvariable=var, width=16)
+                widget = ttk.Entry(form, textvariable=var, width=32 if kind == "text" else 16)
             widget.grid(row=row, column=1, sticky="ew", pady=4)
             self.vars[key] = var
 

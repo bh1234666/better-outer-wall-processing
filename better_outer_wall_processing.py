@@ -134,6 +134,13 @@ LOOP_CLOSE_TOL_MM = 0.25
 LOOP_LEADIN_CLOSE_TOL_MM = 0.05
 LOOP_LEADIN_MAX_MM = 0.75
 MAX_GENERATED_LOOP_SEGMENTS = 2000
+DEFAULT_SPIRAL_ANGLE_SPEED_PROFILE = "45:1.0,30:0.8,15:0.4,0:0.33"
+DEFAULT_SPIRAL_ANGLE_SPEED_POINTS: Tuple[Tuple[float, float], ...] = (
+    (0.0, 0.33),
+    (15.0, 0.4),
+    (30.0, 0.8),
+    (45.0, 1.0),
+)
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -157,6 +164,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "purge_retract_mm": 1.0,
     "max_overhang_deg": -90.0,
     "spiral_speed_scale": 0.66,
+    "spiral_angle_speed_enabled": False,
+    "spiral_angle_speed_profile": DEFAULT_SPIRAL_ANGLE_SPEED_PROFILE,
     "sample_step_mm": 0.2,
     "keep_processed_copy": False,
     "scarf_length_mm": 3.2,
@@ -197,6 +206,8 @@ CONFIG_FIELDS: List[Dict[str, Any]] = [
     {"key": "script_ironing_speed_mm_s", "label": "脚本熨烫速度(mm/s)", "kind": "float"},
     {"key": "path_width_mm", "label": "路径粗细(mm)", "kind": "float"},
     {"key": "spiral_speed_scale", "label": "螺旋速度倍率(1=原速)", "kind": "float"},
+    {"key": "spiral_angle_speed_enabled", "label": "启用螺旋小角度降速", "kind": "bool"},
+    {"key": "spiral_angle_speed_profile", "label": "角度速度曲线(度:倍率)", "kind": "text"},
     {"key": "sample_step_mm", "label": "采样精度(mm)", "kind": "float"},
     {"key": "keep_processed_copy", "label": "保留处理副本", "kind": "bool"},
     {"key": "scarf_length_mm", "label": "斜拼长度(mm)", "kind": "float"},
@@ -379,6 +390,72 @@ def fnum(config: Dict[str, Any], key: str) -> float:
         return float(DEFAULT_CONFIG[key])
 
 
+def parse_spiral_angle_speed_profile(raw: Any) -> Tuple[Tuple[float, float], ...]:
+    """Parse an angle:multiplier profile and return points sorted by angle."""
+    if not isinstance(raw, str):
+        raise ValueError("angle speed profile must be text")
+    points: List[Tuple[float, float]] = []
+    seen: set[float] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or item.count(":") != 1:
+            raise ValueError("angle speed profile must use angle:multiplier pairs")
+        angle_text, scale_text = item.split(":", 1)
+        try:
+            angle = float(angle_text.strip())
+            scale = float(scale_text.strip())
+        except ValueError as exc:
+            raise ValueError("angle speed profile contains a non-numeric value") from exc
+        if not math.isfinite(angle) or not 0.0 <= angle <= 90.0:
+            raise ValueError("angle speed profile angles must be within 0..90 degrees")
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("angle speed profile multipliers must be positive")
+        if angle in seen:
+            raise ValueError("angle speed profile contains a duplicate angle")
+        seen.add(angle)
+        points.append((angle, scale))
+    if len(points) < 2:
+        raise ValueError("angle speed profile requires at least two points")
+    points.sort(key=lambda point: point[0])
+    return tuple(points)
+
+
+def configured_spiral_angle_speed_profile(
+    config: Dict[str, Any],
+) -> Tuple[Tuple[float, float], ...]:
+    try:
+        return parse_spiral_angle_speed_profile(
+            config.get("spiral_angle_speed_profile", DEFAULT_SPIRAL_ANGLE_SPEED_PROFILE)
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_SPIRAL_ANGLE_SPEED_POINTS
+
+
+def spiral_angle_speed_multiplier(
+    angle_deg: float,
+    profile: Sequence[Tuple[float, float]],
+) -> float:
+    angle = max(0.0, min(90.0, angle_deg))
+    if angle <= profile[0][0]:
+        return profile[0][1]
+    for (angle0, scale0), (angle1, scale1) in zip(profile, profile[1:]):
+        if angle <= angle1:
+            span = angle1 - angle0
+            if span <= 1e-12:
+                return scale1
+            t = (angle - angle0) / span
+            return scale0 + (scale1 - scale0) * t
+    return profile[-1][1]
+
+
+def _cli_angle_speed_profile(raw: str) -> str:
+    try:
+        parse_spiral_angle_speed_profile(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return raw.strip()
+
+
 def apply_cli_overrides(config: Dict[str, Any], argv: Sequence[str]) -> Tuple[Dict[str, Any], str]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--secondary-speed-scale", dest="secondary_speed_scale", type=float)
@@ -415,6 +492,18 @@ def apply_cli_overrides(config: Dict[str, Any], argv: Sequence[str]) -> Tuple[Di
     parser.add_argument("--script-ironing-speed", dest="script_ironing_speed_mm_s", type=float)
     parser.add_argument("--path-width", dest="path_width_mm", type=float)
     parser.add_argument("--spiral-speed-scale", dest="spiral_speed_scale", type=float)
+    parser.add_argument(
+        "--enable-angle-speed", "--enable-spiral-angle-speed",
+        dest="spiral_angle_speed_enabled", action="store_true", default=None,
+    )
+    parser.add_argument(
+        "--disable-angle-speed", "--disable-spiral-angle-speed",
+        dest="spiral_angle_speed_enabled", action="store_false", default=None,
+    )
+    parser.add_argument(
+        "--angle-speed-profile", "--spiral-angle-speed-profile",
+        dest="spiral_angle_speed_profile", type=_cli_angle_speed_profile,
+    )
     parser.add_argument("--sample-step", dest="sample_step_mm", type=float)
     parser.add_argument("--keep-copy", dest="keep_processed_copy", action="store_true", default=None)
     parser.add_argument("--no-keep-copy", dest="keep_processed_copy", action="store_false", default=None)
@@ -2421,6 +2510,36 @@ def build_spiral(
             return vx + ox * w, vy + oy * w
         return vx, vy
 
+    angle_speed_enabled = bool(config.get("spiral_angle_speed_enabled", False))
+    angle_speed_profile = (
+        configured_spiral_angle_speed_profile(config)
+        if angle_speed_enabled
+        else DEFAULT_SPIRAL_ANGLE_SPEED_POINTS
+    )
+    revolution_dt = 1.0 / x
+
+    def angle_limited_feed(i: int, t_start: float, t_end: float) -> float:
+        """Use adjacent final sub-layer tracks to measure the local surface angle."""
+        prev_i = (i - 1) % n_verts
+
+        def shifted_center(shift: float) -> Tuple[float, float, float]:
+            shifted_start = max(0.0, min(1.0, t_start + shift))
+            shifted_end = max(0.0, min(1.0, t_end + shift))
+            ax, ay = vertex_at(prev_i, shifted_start)
+            bx, by = vertex_at(i, shifted_end)
+            return (
+                0.5 * (ax + bx),
+                0.5 * (ay + by),
+                0.5 * h * (shifted_start + shifted_end),
+            )
+
+        lower = shifted_center(-revolution_dt)
+        upper = shifted_center(revolution_dt)
+        dxy = math.hypot(upper[0] - lower[0], upper[1] - lower[1])
+        dz = abs(upper[2] - lower[2])
+        angle = 90.0 if dxy <= 1e-12 else math.degrees(math.atan2(dz, dxy))
+        return wall_feed * spiral_angle_speed_multiplier(angle, angle_speed_profile)
+
     ins: List[Ins] = [Ins(kind="comment", text=f"; BOWP spiral start x{x}\n")]
     # 接缝起点补偿（再分配式）：回填后的腔压峰值把后续的料提前挤出形成
     # 突起，突起消耗压力后紧跟一段欠压。补偿按**整圈满流量**为基准在开头
@@ -2481,7 +2600,12 @@ def build_spiral(
                             1.0 - (s_mid - comp_len) / payback_len
                         )
                         de += removed_actual * (w_pb / payback_base)
-            ins.append(Ins(kind="extrude", x=vx, y=vy, z=zf, de=de, f=wall_feed))
+            segment_feed = (
+                angle_limited_feed(i, (k + s0 / total) / x, t)
+                if angle_speed_enabled
+                else wall_feed
+            )
+            ins.append(Ins(kind="extrude", x=vx, y=vy, z=zf, de=de, f=segment_feed))
             px_, py_ = vx, vy
             s0 = s_end
     # 顶部互补填平：螺旋顶面遗留 (1 - s/L)*h/x 的楔形缺口
@@ -2492,14 +2616,16 @@ def build_spiral(
         vx, vy = vertex_at(i, 1.0)
         actual = math.hypot(vx - px_, vy - py_)
         de = seg.de * (actual / seg.length if seg.length > 1e-9 else 1.0) * per_rev * (1.0 - s_mid / total)
-        ins.append(Ins(kind="extrude", x=vx, y=vy, z=z_top, de=de, f=wall_feed))
+        segment_feed = angle_limited_feed(i, 1.0, 1.0) if angle_speed_enabled else wall_feed
+        ins.append(Ins(kind="extrude", x=vx, y=vy, z=z_top, de=de, f=segment_feed))
         px_, py_ = vx, vy
         s0 += seg.length
     if flatten:
         ins.append(Ins(kind="comment", text="; BOWP spiral flatten\n"))
         for i, seg in enumerate(loop.segments):
             vx, vy = vertex_at(i, 1.0)
-            ins.append(Ins(kind="extrude", x=vx, y=vy, z=z_top, de=0.0, f=wall_feed))
+            segment_feed = angle_limited_feed(i, 1.0, 1.0) if angle_speed_enabled else wall_feed
+            ins.append(Ins(kind="extrude", x=vx, y=vy, z=z_top, de=0.0, f=segment_feed))
     ins.append(Ins(kind="comment", text="; BOWP spiral end\n"))
     return ins
 
@@ -3991,6 +4117,8 @@ def build_html(config: Dict[str, Any]) -> str:
         elif kind == "enum":
             options = "".join(f'<option value="{value}">{value}</option>' for value in field["options"])
             control = f'<select id="{key}">{options}</select>'
+        elif kind == "text":
+            control = f'<input id="{key}" type="text">'
         else:
             step = "1" if kind == "int" else "0.01"
             control = f'<input id="{key}" type="number" step="{step}">'
